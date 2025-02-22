@@ -12,10 +12,34 @@ const firebaseConfig = {
   appId: process.env.NEXT_PUBLIC_FIREBASE_APP_ID,
 };
 
+// Validate config
+if (!firebaseConfig.apiKey) throw new Error('Firebase API Key is missing');
+if (!firebaseConfig.authDomain) throw new Error('Firebase Auth Domain is missing');
+if (!firebaseConfig.projectId) throw new Error('Firebase Project ID is missing');
+
 // Initialize Firebase
-const app = getApps().length === 0 ? initializeApp(firebaseConfig) : getApps()[0];
+let app;
+if (!getApps().length) {
+  console.log('Initializing Firebase with config:', {
+    authDomain: firebaseConfig.authDomain,
+    projectId: firebaseConfig.projectId,
+    apiKey: firebaseConfig.apiKey.substring(0, 8) + '...' // Log partial API key for debugging
+  });
+  app = initializeApp(firebaseConfig);
+} else {
+  app = getApps()[0];
+}
+
 const auth = getAuth(app);
 const db = getFirestore(app);
 const storage = getStorage(app);
+
+// Log initialization success
+console.log('Firebase services initialized:', {
+  auth: !!auth,
+  db: !!db,
+  storage: !!storage,
+  currentUser: auth.currentUser?.email || 'none'
+});
 
 export { app, auth, db, storage };

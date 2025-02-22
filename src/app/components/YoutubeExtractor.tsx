@@ -1,29 +1,38 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useRef } from 'react';
 import { useAuth } from '@/lib/hooks/useAuth';
-import { getStorage, ref, uploadBytes, getDownloadURL } from 'firebase/storage';
+import { saveRecording } from '@/lib/firebase/firebaseUtils';
 
 interface TimeInput {
     minutes: string;
     seconds: string;
 }
 
-interface ExtractionResult {
-    title: string;
-    duration: number;
+interface Segment {
+    start: number;
+    end: number;
+    text: string;
+}
+
+interface TranscriptionResult {
+    success: boolean;
+    segments: Segment[];
+    text: string;
+    transcriptionId: string;
     audioUrl: string;
-    firebaseUrl?: string;
 }
 
 export default function YoutubeExtractor() {
+    const { user, signOut } = useAuth();
     const [url, setUrl] = useState('');
     const [startTime, setStartTime] = useState<TimeInput>({ minutes: '0', seconds: '0' });
     const [endTime, setEndTime] = useState<TimeInput>({ minutes: '0', seconds: '0' });
     const [isLoading, setIsLoading] = useState(false);
-    const [error, setError] = useState('');
-    const [result, setResult] = useState<ExtractionResult | null>(null);
-    const { user } = useAuth();
+    const [error, setError] = useState<string | null>(null);
+    const [result, setResult] = useState<TranscriptionResult | null>(null);
+    const audioRef = useRef<HTMLAudioElement>(null);
+    const [currentTime, setCurrentTime] = useState(0);
 
     const convertToSeconds = (time: TimeInput): number => {
         const minutes = parseInt(time.minutes) || 0;
@@ -49,11 +58,16 @@ export default function YoutubeExtractor() {
 
     const handleSubmit = async (e: React.FormEvent) => {
         e.preventDefault();
-        setIsLoading(true);
-        setError('');
-        setResult(null);
+        if (!user) {
+            setError('Please sign in to extract audio');
+            return;
+        }
 
         try {
+            setIsLoading(true);
+            setError(null);
+            setResult(null);
+
             const startTimeInSeconds = convertToSeconds(startTime);
             const endTimeInSeconds = convertToSeconds(endTime);
 
@@ -61,7 +75,8 @@ export default function YoutubeExtractor() {
                 throw new Error('End time must be greater than start time');
             }
 
-            const response = await fetch('/api/extract-audio', {
+            // First extract the audio
+            const extractResponse = await fetch('/api/extract-audio', {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
@@ -73,29 +88,40 @@ export default function YoutubeExtractor() {
                 }),
             });
 
-            const data = await response.json();
+            const extractData = await extractResponse.json();
 
-            if (!response.ok) {
-                throw new Error(data.error || 'Failed to extract audio');
+            if (!extractResponse.ok) {
+                throw new Error(extractData.error || 'Failed to extract audio');
             }
 
-            // Upload to Firebase Storage if extraction was successful
-            let firebaseUrl = undefined;
-            if (data.success && user) {
-                const storage = getStorage();
-                const audioFile = await fetch(data.output_file).then(res => res.blob());
-                const storageRef = ref(storage, `audio/${user.uid}/${data.title}_${Date.now()}.mp3`);
-                await uploadBytes(storageRef, audioFile);
-                firebaseUrl = await getDownloadURL(storageRef);
-            }
-
-            setResult({
-                title: data.title,
-                duration: data.duration,
-                audioUrl: data.output_file,
-                firebaseUrl
+            // Then process the audio with Whisper and save to Firebase
+            const processResponse = await fetch('/api/process-audio', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    audioPath: extractData.output_file,
+                    title: extractData.title,
+                    sourceUrl: url,
+                }),
             });
 
+            const processData = await processResponse.json();
+
+            if (!processResponse.ok) {
+                throw new Error(processData.error || 'Failed to process audio');
+            }
+
+            // Save recording metadata to Firestore
+            await saveRecording({
+                url: processData.audioUrl,
+                title: extractData.title,
+                createdAt: new Date(),
+                userId: user.uid,
+            });
+
+            setResult(processData);
         } catch (err) {
             setError(err instanceof Error ? err.message : 'An error occurred');
         } finally {
@@ -103,12 +129,44 @@ export default function YoutubeExtractor() {
         }
     };
 
+    const formatTime = (seconds: number) => {
+        const minutes = Math.floor(seconds / 60);
+        const remainingSeconds = Math.floor(seconds % 60);
+        return `${minutes}:${remainingSeconds.toString().padStart(2, '0')}`;
+    };
+
+    const handleTimeUpdate = () => {
+        if (audioRef.current) {
+            setCurrentTime(audioRef.current.currentTime);
+        }
+    };
+
+    const jumpToSegment = (start: number) => {
+        if (audioRef.current) {
+            audioRef.current.currentTime = start;
+            audioRef.current.play();
+        }
+    };
+
     return (
-        <div className="max-w-2xl mx-auto p-6 bg-white rounded-xl shadow-lg">
-            <h1 className="text-3xl font-bold mb-8 text-center text-gray-900">
-                YouTube Audio Extractor
-            </h1>
-            
+        <div className="bg-white rounded-xl shadow-lg p-6">
+            <div className="flex justify-between items-center mb-6">
+                <h2 className="text-2xl font-bold text-gray-900">
+                    Extract Audio from YouTube
+                </h2>
+                <div className="flex items-center gap-4">
+                    <span className="text-gray-600">
+                        Signed in as: {user?.email}
+                    </span>
+                    <button
+                        onClick={signOut}
+                        className="px-4 py-2 bg-red-500 text-white rounded hover:bg-red-600 transition-colors"
+                    >
+                        Sign Out
+                    </button>
+                </div>
+            </div>
+
             <form onSubmit={handleSubmit} className="space-y-8">
                 <div className="space-y-3">
                     <label htmlFor="url" className="block text-lg font-semibold text-gray-900">
@@ -198,50 +256,55 @@ export default function YoutubeExtractor() {
                             : 'bg-blue-600 hover:bg-blue-700 shadow-md'
                     }`}
                 >
-                    {isLoading ? 'Processing...' : 'Extract Audio'}
+                    {isLoading ? 'Processing...' : 'Extract and Process Audio'}
                 </button>
-
-                {error && (
-                    <div className="p-4 text-red-700 bg-red-100 rounded-lg text-lg font-medium border-2 border-red-200">
-                        {error}
-                    </div>
-                )}
-
-                {result && (
-                    <div className="space-y-4 p-4 bg-green-50 rounded-lg border-2 border-green-200">
-                        <h3 className="text-lg font-semibold text-green-800">
-                            Audio Extracted Successfully!
-                        </h3>
-                        <div className="space-y-2">
-                            <p className="text-gray-900">Title: {result.title}</p>
-                            <p className="text-gray-900">Duration: {result.duration.toFixed(1)} seconds</p>
-                        </div>
-                        <div className="space-y-2">
-                            <p className="font-medium text-gray-900">Preview:</p>
-                            <audio 
-                                controls 
-                                className="w-full" 
-                                src={result.audioUrl}
-                            >
-                                Your browser does not support the audio element.
-                            </audio>
-                        </div>
-                        {result.firebaseUrl && (
-                            <div className="space-y-2">
-                                <p className="font-medium text-gray-900">Saved to Firebase:</p>
-                                <a 
-                                    href={result.firebaseUrl}
-                                    target="_blank"
-                                    rel="noopener noreferrer"
-                                    className="text-blue-600 hover:text-blue-800 underline"
-                                >
-                                    Download Audio File
-                                </a>
-                            </div>
-                        )}
-                    </div>
-                )}
             </form>
+
+            {error && (
+                <div className="mt-6 p-4 text-red-700 bg-red-100 rounded-lg text-lg font-medium border-2 border-red-200">
+                    {error}
+                </div>
+            )}
+
+            {result && (
+                <div className="mt-8 space-y-6">
+                    <h2 className="text-xl font-semibold text-gray-900">Transcription Results</h2>
+                    
+                    <div className="bg-gray-50 p-4 rounded-lg">
+                        <audio 
+                            ref={audioRef}
+                            src={result.audioUrl}
+                            controls
+                            onTimeUpdate={handleTimeUpdate}
+                            className="w-full mb-4"
+                        />
+                        <h3 className="font-medium mb-2 text-gray-900">Full Text:</h3>
+                        <p className="text-gray-700">{result.text}</p>
+                    </div>
+
+                    <div>
+                        <h3 className="font-medium mb-2 text-gray-900">Segments:</h3>
+                        <div className="space-y-2">
+                            {result.segments.map((segment, index) => (
+                                <div
+                                    key={index}
+                                    className={`bg-white p-4 rounded-lg border-2 border-gray-200 cursor-pointer transition-colors ${
+                                        currentTime >= segment.start && currentTime <= segment.end
+                                            ? 'bg-blue-50 border-blue-300'
+                                            : ''
+                                    }`}
+                                    onClick={() => jumpToSegment(segment.start)}
+                                >
+                                    <div className="text-sm text-gray-500 mb-1">
+                                        {formatTime(segment.start)} - {formatTime(segment.end)}
+                                    </div>
+                                    <p className="text-gray-900">{segment.text}</p>
+                                </div>
+                            ))}
+                        </div>
+                    </div>
+                </div>
+            )}
         </div>
     );
 } 

@@ -1,81 +1,70 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { spawn } from 'child_process';
 import path from 'path';
+import ytdl from 'ytdl-core';
+import fs from 'fs/promises';
 
-export async function POST(request: NextRequest) {
+export async function POST(req: Request) {
     try {
-        const data = await request.json();
-        const { url, startTime, endTime } = data;
+        const { url, startTime, endTime } = await req.json();
 
-        if (!url || startTime === undefined || endTime === undefined) {
-            return NextResponse.json({ error: 'Missing required parameters' }, { status: 400 });
+        if (!url) {
+            return NextResponse.json(
+                { error: 'URL is required' },
+                { status: 400 }
+            );
         }
 
-        const pythonScript = path.join(process.cwd(), 'src', 'lib', 'python', 'youtube_audio_extractor.py');
-        const pythonInterpreter = path.join(process.cwd(), '.venv', 'Scripts', 'python.exe');
+        // Validate YouTube URL
+        if (!ytdl.validateURL(url)) {
+            return NextResponse.json(
+                { error: 'Invalid YouTube URL' },
+                { status: 400 }
+            );
+        }
 
-        return new Promise((resolve) => {
-            const pythonProcess = spawn(pythonInterpreter, [
-                pythonScript,
-                url,
-                startTime.toString(),
-                endTime.toString()
-            ]);
+        // Get video info
+        const info = await ytdl.getInfo(url);
+        const videoTitle = info.videoDetails.title.replace(/[^a-z0-9]/gi, '_').toLowerCase();
+        
+        // Create output directory if it doesn't exist
+        const publicDir = path.join(process.cwd(), 'public', 'temp');
+        await fs.mkdir(publicDir, { recursive: true });
 
-            let stdoutData = '';
-            let stderrData = '';
+        // Generate unique filename
+        const timestamp = Date.now();
+        const outputFilename = `${timestamp}_${videoTitle}.mp3`;
+        const outputPath = path.join('temp', outputFilename);
+        const fullOutputPath = path.join(publicDir, outputFilename);
 
-            pythonProcess.stdout.on('data', (data) => {
-                stdoutData += data.toString();
-            });
-
-            pythonProcess.stderr.on('data', (data) => {
-                stderrData += data.toString();
-            });
-
-            pythonProcess.on('close', (code) => {
-                try {
-                    // Try to find the JSON output in stdout
-                    const jsonMatch = stdoutData.match(/\{.*\}/);
-                    if (jsonMatch && code === 0) {
-                        const result = JSON.parse(jsonMatch[0]);
-                        resolve(NextResponse.json(result));
-                    } else {
-                        console.error('Python script error:', stderrData || stdoutData);
-                        resolve(NextResponse.json(
-                            { error: 'Failed to extract audio', details: stderrData || stdoutData },
-                            { status: 500 }
-                        ));
-                    }
-                } catch (error) {
-                    console.error('Error parsing Python output:', error);
-                    resolve(NextResponse.json(
-                        { 
-                            error: 'Invalid response from Python script', 
-                            details: error instanceof Error ? error.message : String(error)
-                        },
-                        { status: 500 }
-                    ));
-                }
-            });
-
-            pythonProcess.on('error', (error) => {
-                console.error('Failed to start Python process:', error);
-                resolve(NextResponse.json(
-                    { 
-                        error: 'Failed to start Python process', 
-                        details: error instanceof Error ? error.message : String(error)
-                    },
-                    { status: 500 }
-                ));
-            });
+        // Download audio
+        const audioStream = ytdl(url, {
+            filter: 'audioonly',
+            quality: 'highestaudio'
         });
+
+        // Save to file
+        const fileStream = await fs.open(fullOutputPath, 'w');
+        const writeStream = fileStream.createWriteStream();
+        audioStream.pipe(writeStream);
+
+        await new Promise<void>((resolve, reject) => {
+            writeStream.on('finish', () => resolve());
+            writeStream.on('error', reject);
+        });
+
+        return NextResponse.json({
+            success: true,
+            output_file: outputPath,
+            title: videoTitle
+        });
+
     } catch (error) {
-        console.error('API route error:', error);
+        console.error('Error in extract-audio:', error);
         return NextResponse.json(
             { 
-                error: 'Internal server error', 
-                details: error instanceof Error ? error.message : String(error)
+                error: error instanceof Error ? error.message : 'An unexpected error occurred',
+                details: error instanceof Error ? error.stack : undefined
             },
             { status: 500 }
         );
