@@ -1,8 +1,17 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { spawn } from 'child_process';
 import path from 'path';
-import ytdl from 'ytdl-core';
 import fs from 'fs/promises';
+import { exec } from 'child_process';
+import { promisify } from 'util';
+
+const execAsync = promisify(exec);
+
+interface VideoInfo {
+    title: string;
+    duration: number;
+    description: string;
+    [key: string]: any;
+}
 
 export async function POST(req: Request) {
     try {
@@ -15,49 +24,63 @@ export async function POST(req: Request) {
             );
         }
 
-        // Validate YouTube URL
-        if (!ytdl.validateURL(url)) {
+        try {
+            // Create output directory if it doesn't exist
+            const publicDir = path.join(process.cwd(), 'public', 'temp');
+            await fs.mkdir(publicDir, { recursive: true });
+
+            // Generate unique filenames
+            const timestamp = Date.now();
+            const fullOutputFilename = `${timestamp}_full.mp3`;
+            const trimmedOutputFilename = `${timestamp}_trimmed.mp3`;
+            const fullOutputPath = path.join(publicDir, fullOutputFilename);
+            const trimmedOutputPath = path.join(publicDir, trimmedOutputFilename);
+            const outputPath = path.join('temp', trimmedOutputFilename);
+
+            // Get video info first
+            const { stdout: infoJson } = await execAsync(`yt-dlp -j "${url}"`);
+            const videoInfo = JSON.parse(infoJson);
+
+            if (!videoInfo) {
+                throw new Error('Could not get video information');
+            }
+
+            // Download audio using yt-dlp
+            await execAsync(
+                `yt-dlp -x --audio-format mp3 --audio-quality 0 -o "${fullOutputPath}" "${url}"`
+            );
+
+            // Verify the file exists
+            const fileStats = await fs.stat(fullOutputPath);
+            if (!fileStats.size) {
+                throw new Error('Downloaded file is empty');
+            }
+
+            // Trim the audio using ffmpeg
+            const duration = endTime - startTime;
+            await execAsync(
+                `ffmpeg -i "${fullOutputPath}" -ss ${startTime} -t ${duration} "${trimmedOutputPath}"`
+            );
+
+            // Clean up the full file
+            await fs.unlink(fullOutputPath);
+
+            return NextResponse.json({
+                success: true,
+                output_file: outputPath,
+                title: videoInfo.title || trimmedOutputFilename
+            });
+
+        } catch (ytError) {
+            console.error('YouTube extraction error:', ytError);
             return NextResponse.json(
-                { error: 'Invalid YouTube URL' },
-                { status: 400 }
+                { 
+                    error: 'Failed to extract audio from YouTube. The video might be restricted or unavailable.',
+                    details: ytError instanceof Error ? ytError.message : 'Unknown error'
+                },
+                { status: 422 }
             );
         }
-
-        // Get video info
-        const info = await ytdl.getInfo(url);
-        const videoTitle = info.videoDetails.title.replace(/[^a-z0-9]/gi, '_').toLowerCase();
-        
-        // Create output directory if it doesn't exist
-        const publicDir = path.join(process.cwd(), 'public', 'temp');
-        await fs.mkdir(publicDir, { recursive: true });
-
-        // Generate unique filename
-        const timestamp = Date.now();
-        const outputFilename = `${timestamp}_${videoTitle}.mp3`;
-        const outputPath = path.join('temp', outputFilename);
-        const fullOutputPath = path.join(publicDir, outputFilename);
-
-        // Download audio
-        const audioStream = ytdl(url, {
-            filter: 'audioonly',
-            quality: 'highestaudio'
-        });
-
-        // Save to file
-        const fileStream = await fs.open(fullOutputPath, 'w');
-        const writeStream = fileStream.createWriteStream();
-        audioStream.pipe(writeStream);
-
-        await new Promise<void>((resolve, reject) => {
-            writeStream.on('finish', () => resolve());
-            writeStream.on('error', reject);
-        });
-
-        return NextResponse.json({
-            success: true,
-            output_file: outputPath,
-            title: videoTitle
-        });
 
     } catch (error) {
         console.error('Error in extract-audio:', error);

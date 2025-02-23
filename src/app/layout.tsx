@@ -7,7 +7,7 @@ const inter = Inter({ subsets: ['latin'] })
 
 export const metadata: Metadata = {
   title: 'YouTube Audio Extractor',
-  description: 'Extract audio segments from YouTube videos',
+  description: 'Extract audio from YouTube videos',
 }
 
 export default function RootLayout({
